@@ -1,0 +1,6 @@
+{
+  "name": "SynthCinema",
+  "description": "Discover, curate, and watch the best AI-generated movies from YouTube and Facebook, organized by genre with search and synced personalized watch history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
