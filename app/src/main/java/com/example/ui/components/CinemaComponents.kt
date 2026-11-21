@@ -702,7 +702,7 @@ fun ImportUrlDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "Paste any public YouTube or Facebook Watch video URL. SynthCinema will scrape its title, artwork, genre, and AI tools directly into your vault.",
+                    text = "Paste any public YouTube or Facebook Watch video URL. Only feature-length videos strictly longer than 45 minutes will be added to your vault.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

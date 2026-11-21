@@ -3,6 +3,12 @@ package com.example.data.model
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
+/**
+ * Filter rule: Only feature-length movies strictly longer than 45 minutes (2,700 seconds)
+ * are allowed to be added to the database.
+ */
+const val MIN_FEATURE_DURATION_SECONDS: Int = 45 * 60
+
 enum class MovieSource(val label: String) {
     YOUTUBE("YouTube"),
     FACEBOOK("Facebook");
@@ -14,15 +20,15 @@ enum class MovieSource(val label: String) {
 }
 
 enum class MovieGenre(val displayName: String, val scrapeQuery: String) {
-    ALL("All", "AI generated short film 4k"),
-    SCI_FI("Sci-Fi", "AI sci-fi short film movie 4k"),
-    CYBERPUNK("Cyberpunk", "AI cyberpunk short film neon"),
-    HORROR("Horror", "AI horror thriller short film"),
-    FANTASY("Fantasy", "AI dark fantasy short film epic"),
-    ANIMATION("Animation", "AI animated short movie 3D"),
-    DOCUMENTARY("Documentary", "AI documentary short film future"),
-    COMEDY("Comedy", "AI comedy satire short film Neural Viz"),
-    EXPERIMENTAL("Experimental", "experimental AI cinema Runway Sora Kling Veo");
+    ALL("All", "AI generated full movie 4k"),
+    SCI_FI("Sci-Fi", "AI sci-fi full movie 4k"),
+    CYBERPUNK("Cyberpunk", "AI cyberpunk full movie"),
+    HORROR("Horror", "AI horror thriller full movie"),
+    FANTASY("Fantasy", "AI dark fantasy full movie 4k"),
+    ANIMATION("Animation", "AI animated full movie"),
+    DOCUMENTARY("Documentary", "AI documentary full movie"),
+    COMEDY("Comedy", "AI comedy sci-fi full movie"),
+    EXPERIMENTAL("Experimental", "AI feature film full movie");
 
     companion object {
         val browsableGenres: List<MovieGenre> = entries.filter { it != ALL }
@@ -64,6 +70,9 @@ data class AiMovieEntity(
 
     val aiToolList: List<String>
         get() = aiTools.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+    val meetsFeatureLengthRule: Boolean
+        get() = durationSeconds > MIN_FEATURE_DURATION_SECONDS
 }
 
 @Entity(tableName = "watch_history")
@@ -113,6 +122,7 @@ data class ScrapeReport(
     val totalAdded: Int,
     val youtubeFound: Int,
     val facebookFound: Int,
+    val skippedUnderMinDuration: Int = 0,
     val errorNote: String? = null
 )
 
@@ -139,5 +149,16 @@ data class CreatorChannelEntity(
 data class ChannelScrapeResult(
     val channel: CreatorChannelEntity,
     val movies: List<AiMovieEntity>,
+    val skippedUnderMinDuration: Int = 0,
     val note: String? = null
+)
+
+data class YouTubeChannelSearchResult(
+    val channelId: String,
+    val name: String,
+    val handle: String,
+    val channelUrl: String,
+    val avatarUrl: String,
+    val statsText: String,
+    val description: String
 )

@@ -142,6 +142,8 @@ private fun SynthCinemaApp(viewModel: CinemaViewModel) {
     val navController = rememberNavController()
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val curatorState by viewModel.curatorState.collectAsStateWithLifecycle()
+    val channelSearchState by viewModel.channelSearchState.collectAsStateWithLifecycle()
+    val ytMovieSearchState by viewModel.ytMovieSearchState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
     val backStackEntry by navController.currentBackStackEntryAsState()
@@ -272,7 +274,18 @@ private fun SynthCinemaApp(viewModel: CinemaViewModel) {
                     composable(ROUTE_DISCOVER) {
                         DiscoverScreen(
                             uiState = uiState,
+                            ytMovieSearchState = ytMovieSearchState,
                             onSearchQueryChanged = viewModel::onSearchQueryChanged,
+                            onYouTubeMovieQueryChanged = viewModel::onYouTubeMovieQueryChanged,
+                            onSearchYouTubeMovies = { viewModel.searchYouTubeForAiMovies() },
+                            onClearYouTubeMovieSearch = viewModel::clearYouTubeMovieSearch,
+                            onSaveYouTubeMovie = { movie -> viewModel.saveYouTubeMovieToVault(movie) },
+                            onWatchYouTubeMovie = { movie ->
+                                viewModel.saveYouTubeMovieToVault(movie) { savedId ->
+                                    navigateToPlayer(savedId)
+                                }
+                            },
+                            onSaveAllYouTubeMovies = viewModel::saveAllSearchedYouTubeMovies,
                             onGenreSelected = viewModel::onGenreSelected,
                             onSourceSelected = viewModel::onSourceFilterSelected,
                             onScrapeFresh = { viewModel.scrapeFreshMovies() },
@@ -290,6 +303,14 @@ private fun SynthCinemaApp(viewModel: CinemaViewModel) {
                     composable(ROUTE_CHANNELS) {
                         ChannelsScreen(
                             uiState = uiState,
+                            channelSearchState = channelSearchState,
+                            onChannelSearchKeywordChanged = viewModel::onYouTubeChannelKeywordChanged,
+                            onChannelSearchGenreChanged = viewModel::onYouTubeChannelSearchGenreChanged,
+                            onSearchYouTubeChannels = viewModel::searchYouTubeChannels,
+                            onToggleSelectYouTubeChannel = viewModel::toggleYouTubeChannelSelection,
+                            onClearSelectedYouTubeChannels = viewModel::clearYouTubeChannelSelection,
+                            onAddSelectedYouTubeChannels = viewModel::addPickedYouTubeChannels,
+                            onAddSingleSearchedYouTubeChannel = viewModel::addSingleSearchedYouTubeChannel,
                             onAddChannel = viewModel::addChannelOrProfile,
                             onSyncChannel = viewModel::syncChannel,
                             onSyncAllChannels = viewModel::syncAllChannels,

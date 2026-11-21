@@ -4,8 +4,10 @@ import android.util.Log
 import com.example.data.model.AiMovieEntity
 import com.example.data.model.ChannelScrapeResult
 import com.example.data.model.CreatorChannelEntity
+import com.example.data.model.MIN_FEATURE_DURATION_SECONDS
 import com.example.data.model.MovieGenre
 import com.example.data.model.MovieSource
+import com.example.data.model.YouTubeChannelSearchResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -22,10 +24,32 @@ import kotlin.math.abs
 
 private const val TAG = "AiMovieScraper"
 
+// YouTube search parameter that restricts results to long videos (> 20 minutes)
+private const val YOUTUBE_LONG_VIDEO_SP = "EgIYAg%3D%3D"
+// YouTube search parameter that restricts results to Channels (Type: Channel)
+private const val YOUTUBE_CHANNEL_SEARCH_SP = "EgIQAg%3D%3D"
+
+data class PlatformScrapeBatch(
+    val movies: List<AiMovieEntity>,
+    val skippedUnderMinDuration: Int,
+    val errorNote: String? = null
+)
+
+private data class ParsedRendererResult(
+    val movies: List<AiMovieEntity>,
+    val skippedUnderMinDuration: Int
+)
+
+data class YouTubeMovieSearchBatch(
+    val movies: List<AiMovieEntity>,
+    val skippedUnderMinDuration: Int,
+    val executedQuery: String
+)
+
 /**
- * Real network scraper that fetches live AI-generated movies & short films
+ * Real network scraper that fetches live full-length (>45 min) AI-generated movies
  * from YouTube public search pages, YouTube channels (/videos + Atom XML feeds),
- * and Facebook public Watch/Reel results, pages, and profiles.
+ * and Facebook public Watch/Video listings, profiles, and direct URLs.
  */
 class AiMovieScraperEngine(
     private val client: OkHttpClient = OkHttpClient.Builder()
@@ -41,42 +65,49 @@ class AiMovieScraperEngine(
 
     suspend fun scrapeAllPlatforms(
         genres: List<MovieGenre> = MovieGenre.browsableGenres
-    ): Pair<List<AiMovieEntity>, String?> = withContext(Dispatchers.IO) {
+    ): PlatformScrapeBatch = withContext(Dispatchers.IO) {
         val collected = mutableListOf<AiMovieEntity>()
+        var totalSkippedShort = 0
         val errors = mutableListOf<String>()
 
         coroutineScope {
             val ytJobs = genres.map { genre ->
                 async {
                     try {
-                        scrapeYouTubeByQuery(
+                        scrapeYouTubeByQueryInternal(
                             query = genre.scrapeQuery,
                             preferredGenre = genre,
-                            maxResults = 6
+                            maxResults = 8
                         )
                     } catch (e: Exception) {
                         Log.w(TAG, "YouTube scrape failed for ${genre.displayName}: ${e.message}")
                         synchronized(errors) { errors.add("YT ${genre.displayName}") }
-                        emptyList()
+                        ParsedRendererResult(emptyList(), 0)
                     }
                 }
             }
 
             val fbJob = async {
                 try {
-                    scrapeFacebookAiVideos(maxResults = 8)
+                    scrapeFacebookAiVideosInternal(maxResults = 8)
                 } catch (e: Exception) {
                     Log.w(TAG, "Facebook scrape failed: ${e.message}")
                     synchronized(errors) { errors.add("Facebook") }
-                    emptyList()
+                    ParsedRendererResult(emptyList(), 0)
                 }
             }
 
-            ytJobs.awaitAll().forEach { collected.addAll(it) }
-            collected.addAll(fbJob.await())
+            ytJobs.awaitAll().forEach { batch ->
+                collected.addAll(batch.movies)
+                totalSkippedShort += batch.skippedUnderMinDuration
+            }
+            val fbBatch = fbJob.await()
+            collected.addAll(fbBatch.movies)
+            totalSkippedShort += fbBatch.skippedUnderMinDuration
         }
 
         val deduplicated = collected
+            .filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
             .distinctBy { it.id }
             .sortedByDescending { it.ratingScore }
 
@@ -86,15 +117,166 @@ class AiMovieScraperEngine(
             null
         }
 
-        deduplicated to errorSummary
+        PlatformScrapeBatch(
+            movies = deduplicated,
+            skippedUnderMinDuration = totalSkippedShort,
+            errorNote = errorSummary
+        )
     }
 
     /**
-     * Scrapes movies directly from a YouTube channel URL, @handle, channel ID (UC...), or channel name.
+     * Searches YouTube for channels matching the given keywords using YouTube's native
+     * Type: Channel filter (sp=EgIQAg==), supplemented by channels publishing long (>20m)
+     * videos for that keyword when fewer than 4 direct channel matches are returned.
+     */
+    suspend fun searchYouTubeChannels(
+        keyword: String,
+        maxResults: Int = 15
+    ): Result<List<YouTubeChannelSearchResult>> = withContext(Dispatchers.IO) {
+        val trimmed = keyword.trim()
+        if (trimmed.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Enter keywords to search YouTube channels."))
+        }
+
+        val encoded = URLEncoder.encode(trimmed, "UTF-8")
+        val collected = mutableListOf<YouTubeChannelSearchResult>()
+        val seenKeys = mutableSetOf<String>()
+
+        // 1. Primary pass: YouTube Channel search (sp=EgIQAg==)
+        val channelSearchUrl = "https://www.youtube.com/results?search_query=$encoded&sp=$YOUTUBE_CHANNEL_SEARCH_SP"
+        val channelHtml = fetchHtml(channelSearchUrl)
+        if (channelHtml.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("Could not reach YouTube right now. Check your connection and try again.")
+            )
+        }
+
+        val initialDataJson = extractBalancedJson(channelHtml, "var ytInitialData = ")
+            ?: extractBalancedJson(channelHtml, "window[\"ytInitialData\"] = ")
+
+        if (initialDataJson != null) {
+            runCatching {
+                val root = JSONObject(initialDataJson)
+                val renderers = mutableListOf<JSONObject>()
+                collectChannelRenderers(root, renderers, maxCount = maxResults + 5)
+                parseChannelRenderers(renderers, maxResults).forEach { candidate ->
+                    val dedupeKey = candidate.channelId.ifBlank { candidate.channelUrl.lowercase() }
+                    if (seenKeys.add(dedupeKey)) {
+                        collected.add(candidate)
+                    }
+                }
+            }.onFailure {
+                Log.w(TAG, "Failed parsing YouTube channel search JSON: ${it.message}")
+            }
+        }
+
+        // 2. Secondary pass: if keyword is movie/topic-oriented and yielded < 4 channels,
+        // extract unique creator channels from YouTube's long-video (>20m) search results
+        if (collected.size < 4) {
+            val longVideoUrl = "https://www.youtube.com/results?search_query=$encoded&sp=$YOUTUBE_LONG_VIDEO_SP"
+            val videoHtml = fetchHtml(longVideoUrl)
+            val videoDataJson = extractBalancedJson(videoHtml, "var ytInitialData = ")
+                ?: extractBalancedJson(videoHtml, "window[\"ytInitialData\"] = ")
+            if (videoDataJson != null) {
+                runCatching {
+                    val root = JSONObject(videoDataJson)
+                    val videoRenderers = mutableListOf<JSONObject>()
+                    collectVideoRenderers(root, videoRenderers, maxCount = 35)
+                    extractChannelsFromVideoRenderers(videoRenderers, maxResults - collected.size).forEach { candidate ->
+                        val dedupeKey = candidate.channelId.ifBlank { candidate.channelUrl.lowercase() }
+                        if (seenKeys.add(dedupeKey)) {
+                            collected.add(candidate)
+                        }
+                    }
+                }.onFailure {
+                    Log.w(TAG, "Failed extracting fallback channels from video search: ${it.message}")
+                }
+            }
+        }
+
+        Result.success(collected.take(maxResults))
+    }
+
+    /**
+     * Searches YouTube directly for full-length (>45m) AI movies matching user keywords.
+     * Automatically appends "AI movie" context when the query doesn't already mention AI,
+     * uses YouTube's >20m long-video filter, and strictly enforces >45m (2700s).
+     */
+    suspend fun searchYouTubeAiMovies(
+        keyword: String,
+        maxResults: Int = 18
+    ): Result<YouTubeMovieSearchBatch> = withContext(Dispatchers.IO) {
+        val trimmed = keyword.trim()
+        if (trimmed.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Enter keywords to search YouTube for AI movies."))
+        }
+
+        val lower = trimmed.lowercase()
+        val hasAiTerm = Regex("""\b(ai|a\.i\.|sora|runway|kling|veo|midjourney|luma|pika|generative)\b""")
+            .containsMatchIn(lower)
+        val hasMovieTerm = Regex("""\b(movie|film|cinema|documentary|feature)\b""")
+            .containsMatchIn(lower)
+
+        val effectiveQuery = buildString {
+            append(trimmed)
+            if (!hasAiTerm) append(" AI")
+            if (!hasMovieTerm) append(" full movie")
+        }
+
+        val encoded = URLEncoder.encode(effectiveQuery, "UTF-8")
+        val url = "https://www.youtube.com/results?search_query=$encoded&sp=$YOUTUBE_LONG_VIDEO_SP"
+        val html = fetchHtml(url)
+        if (html.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("Could not reach YouTube right now. Check your connection and try again.")
+            )
+        }
+
+        val initialDataJson = extractBalancedJson(html, "var ytInitialData = ")
+            ?: extractBalancedJson(html, "window[\"ytInitialData\"] = ")
+            ?: return@withContext Result.success(
+                YouTubeMovieSearchBatch(
+                    movies = emptyList(),
+                    skippedUnderMinDuration = 0,
+                    executedQuery = effectiveQuery
+                )
+            )
+
+        runCatching {
+            val root = JSONObject(initialDataJson)
+            val renderers = mutableListOf<JSONObject>()
+            collectVideoRenderers(root, renderers, maxCount = 65)
+            val parsed = parseVideoRenderers(
+                renderers = renderers,
+                fallbackChannel = "YouTube AI Creator",
+                preferredGenre = MovieGenre.ALL,
+                maxResults = maxResults
+            )
+            val valid = parsed.movies
+                .filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+                .distinctBy { it.id }
+            YouTubeMovieSearchBatch(
+                movies = valid,
+                skippedUnderMinDuration = parsed.skippedUnderMinDuration,
+                executedQuery = effectiveQuery
+            )
+        }.fold(
+            onSuccess = { Result.success(it) },
+            onFailure = { err ->
+                Log.w(TAG, "YouTube AI movie search parse error: ${err.message}")
+                Result.failure(IllegalStateException("Unable to parse YouTube results right now."))
+            }
+        )
+    }
+
+    /**
+     * Scrapes movies strictly longer than 45 minutes from a YouTube channel URL, @handle, or ID.
      */
     suspend fun scrapeYouTubeChannel(
         rawInput: String,
-        preferredGenre: MovieGenre = MovieGenre.ALL
+        preferredGenre: MovieGenre = MovieGenre.ALL,
+        fallbackName: String? = null,
+        fallbackAvatarUrl: String? = null
     ): Result<ChannelScrapeResult> = withContext(Dispatchers.IO) {
         val cleaned = rawInput.trim()
         if (cleaned.isBlank()) {
@@ -108,12 +290,15 @@ class AiMovieScraperEngine(
         val ogTitle = extractMetaContent(html, "og:title")
             ?.replace(" - YouTube", "", ignoreCase = true)
             ?.trim()
-        val ogAvatar = extractMetaContent(html, "og:image").orEmpty()
+        val ogAvatar = extractMetaContent(html, "og:image")
+            ?.takeIf { it.startsWith("https://") }
+            ?: fallbackAvatarUrl.orEmpty()
 
         val channelIdFromHtml = extractYouTubeChannelId(html)
             ?: extractYouTubeChannelIdFromUrl(channelUrl)
 
         val channelName = ogTitle?.takeIf { it.isNotBlank() && !it.equals("YouTube", ignoreCase = true) }
+            ?: fallbackName?.takeIf { it.isNotBlank() }
             ?: cleaned.removePrefix("https://").removePrefix("http://")
                 .substringAfter("youtube.com/")
                 .substringBefore("/")
@@ -121,52 +306,47 @@ class AiMovieScraperEngine(
                 .ifBlank { cleaned }
 
         val collected = mutableListOf<AiMovieEntity>()
+        var skippedShort = 0
 
-        // 1. Parse videos directly from the channel's /videos ytInitialData JSON
+        // 1. Parse videos directly from the channel's /videos ytInitialData JSON (includes exact duration)
         val initialDataJson = extractBalancedJson(html, "var ytInitialData = ")
             ?: extractBalancedJson(html, "window[\"ytInitialData\"] = ")
         if (initialDataJson != null) {
             runCatching {
                 val root = JSONObject(initialDataJson)
                 val renderers = mutableListOf<JSONObject>()
-                collectVideoRenderers(root, renderers, maxCount = 24)
-                collected.addAll(
-                    parseVideoRenderers(
-                        renderers = renderers,
-                        fallbackChannel = channelName,
-                        preferredGenre = preferredGenre,
-                        maxResults = 15,
-                        allowShortClips = true
-                    )
+                collectVideoRenderers(root, renderers, maxCount = 60)
+                val parsed = parseVideoRenderers(
+                    renderers = renderers,
+                    fallbackChannel = channelName,
+                    preferredGenre = preferredGenre,
+                    maxResults = 18
                 )
+                collected.addAll(parsed.movies)
+                skippedShort += parsed.skippedUnderMinDuration
             }.onFailure {
                 Log.w(TAG, "Failed parsing channel ytInitialData: ${it.message}")
             }
         }
 
-        // 2. Also fetch official YouTube public Atom XML RSS feed if we have the UC... channelId
-        if (collected.size < 6 && !channelIdFromHtml.isNullOrBlank()) {
-            val feedVideos = scrapeYouTubeChannelRss(
-                channelId = channelIdFromHtml,
-                fallbackChannelName = channelName,
-                preferredGenre = preferredGenre
-            )
-            collected.addAll(feedVideos)
-        }
-
-        // 3. Fallback search by channel name / handle if HTML was consent-gated
-        if (collected.isEmpty()) {
-            val searchFallback = runCatching {
-                scrapeYouTubeByQuery(
-                    query = "$channelName AI film OR short film",
+        // 2. Also query YouTube long-video search scoped to this channel name for >45m full movies
+        if (collected.size < 6) {
+            val searchBatch = runCatching {
+                scrapeYouTubeByQueryInternal(
+                    query = "\"$channelName\" full movie",
                     preferredGenre = preferredGenre,
-                    maxResults = 10
+                    maxResults = 12
                 )
-            }.getOrDefault(emptyList())
-            collected.addAll(searchFallback)
+            }.getOrDefault(ParsedRendererResult(emptyList(), 0))
+            collected.addAll(searchBatch.movies)
+            skippedShort += searchBatch.skippedUnderMinDuration
         }
 
-        val uniqueMovies = collected.distinctBy { it.id }.take(18)
+        val uniqueMovies = collected
+            .filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+            .distinctBy { it.id }
+            .take(18)
+
         val externalId = channelIdFromHtml ?: cleaned.lowercase().replace(Regex("[^a-z0-9@_-]"), "")
         val stableId = "yt_ch_${abs((channelIdFromHtml ?: channelUrl.lowercase()).hashCode())}"
 
@@ -184,23 +364,28 @@ class AiMovieScraperEngine(
             addedAt = now
         )
 
-        val note = if (uniqueMovies.isEmpty()) {
-            "Channel saved, but no public videos could be fetched right now. Tap Sync later to retry."
-        } else {
-            null
+        val note = when {
+            uniqueMovies.isEmpty() && skippedShort > 0 ->
+                "Saved ${channelEntity.name}, but skipped $skippedShort videos under 45 minutes (0 feature films >45m found)."
+            uniqueMovies.isEmpty() ->
+                "Saved ${channelEntity.name}, but no public movies longer than 45 minutes were found right now."
+            skippedShort > 0 ->
+                "Added ${channelEntity.name}: ${uniqueMovies.size} feature movies (>45m) imported, $skippedShort shorter videos filtered out."
+            else -> null
         }
 
         Result.success(
             ChannelScrapeResult(
                 channel = channelEntity,
                 movies = uniqueMovies,
+                skippedUnderMinDuration = skippedShort,
                 note = note
             )
         )
     }
 
     /**
-     * Scrapes public movies/videos from a Facebook profile or page URL / handle.
+     * Scrapes public movies strictly longer than 45 minutes from a Facebook profile or page URL / handle.
      */
     suspend fun scrapeFacebookProfile(
         rawInput: String,
@@ -237,52 +422,18 @@ class AiMovieScraperEngine(
 
         val discovered = mutableListOf<AiMovieEntity>()
         val seenUrls = mutableSetOf<String>()
+        var skippedShort = 0
         val now = System.currentTimeMillis()
 
-        // 1. Extract any public video/reel links directly present in the profile HTML
-        val directVideoRegex = Regex(
-            """https://(?:www\.|m\.)?facebook\.com/(?:watch/\?v=\d+|[^"'\\s<>]+/videos/\d+|reel/\d+)""",
-            RegexOption.IGNORE_CASE
-        )
-        directVideoRegex.findAll(html).forEachIndexed { idx, match ->
-            if (discovered.size >= 10) return@forEachIndexed
-            val url = match.value
-            if (!seenUrls.add(url)) return@forEachIndexed
-            val fbVid = extractFacebookVideoId(url)
-            val genre = if (preferredGenre != MovieGenre.ALL) preferredGenre else classifyGenre(profileName, ogDesc, MovieGenre.SCI_FI)
-            discovered.add(
-                AiMovieEntity(
-                    id = "fb_${abs(url.hashCode())}",
-                    title = "$profileName — Video #${idx + 1}",
-                    director = profileName,
-                    source = MovieSource.FACEBOOK.name,
-                    videoId = fbVid,
-                    watchUrl = url,
-                    thumbnailUrl = ogAvatar,
-                    genre = genre.name,
-                    durationText = "04:00",
-                    durationSeconds = 240,
-                    viewCountText = "Facebook Profile",
-                    synopsis = ogDesc.ifBlank { "Public video scraped from $profileName on Facebook." },
-                    aiTools = detectAiTools("$profileName $ogDesc"),
-                    publishedText = "Facebook",
-                    ratingScore = 8.8f,
-                    isFeatured = false,
-                    isScrapedLive = true,
-                    addedAt = now - (idx * 60L)
-                )
-            )
-        }
-
-        // 2. Discover public videos/reels published by this Facebook profile via web index search
+        // 1. Discover public full-length videos published by this Facebook profile via web index search
         val queries = listOfNotNull(
+            if (slug.isNotBlank() && !slug.startsWith("profile.php")) "site:facebook.com/$slug/videos full movie" else null,
             if (slug.isNotBlank() && !slug.startsWith("profile.php")) "site:facebook.com/$slug/videos" else null,
-            if (slug.isNotBlank() && !slug.startsWith("profile.php")) "site:facebook.com/$slug video OR reel" else null,
-            "site:facebook.com \"$profileName\" video OR reel OR watch"
+            "site:facebook.com \"$profileName\" \"full movie\""
         )
 
         for (query in queries) {
-            if (discovered.size >= 12) break
+            if (discovered.size >= 10) break
             val encoded = URLEncoder.encode(query, "UTF-8")
             val ddgHtml = fetchHtml("https://html.duckduckgo.com/html/?q=$encoded")
             if (ddgHtml.isBlank()) continue
@@ -298,7 +449,7 @@ class AiMovieScraperEngine(
             val snippets = snippetRegex.findAll(ddgHtml).map { stripHtml(it.groupValues[1]) }.toList()
 
             linkRegex.findAll(ddgHtml).forEachIndexed { idx, match ->
-                if (discovered.size >= 12) return@forEachIndexed
+                if (discovered.size >= 10) return@forEachIndexed
                 val resolvedUrl = resolveDuckDuckGoUrl(match.groupValues[1])
                 if (!resolvedUrl.contains("facebook.com", ignoreCase = true)) return@forEachIndexed
                 if (!seenUrls.add(resolvedUrl)) return@forEachIndexed
@@ -312,6 +463,19 @@ class AiMovieScraperEngine(
                 val snippet = snippets.getOrNull(idx)
                     ?.takeIf { it.isNotBlank() }
                     ?: "Video from $profileName on Facebook."
+
+                // Verify duration from snippet/title or video page metadata; strictly require > 45 min
+                var durationSeconds = extractDurationSecondsFromText("$rawTitle $snippet")
+                if (durationSeconds == 0) {
+                    val videoPageHtml = fetchHtml(resolvedUrl)
+                    durationSeconds = extractDurationSecondsFromHtml(videoPageHtml)
+                }
+
+                if (durationSeconds <= MIN_FEATURE_DURATION_SECONDS) {
+                    skippedShort++
+                    return@forEachIndexed
+                }
+
                 val genre = if (preferredGenre != MovieGenre.ALL) {
                     preferredGenre
                 } else {
@@ -329,13 +493,13 @@ class AiMovieScraperEngine(
                         watchUrl = resolvedUrl,
                         thumbnailUrl = ogAvatar,
                         genre = genre.name,
-                        durationText = "04:30",
-                        durationSeconds = 270,
-                        viewCountText = "Facebook Video",
+                        durationText = formatSecondsToDuration(durationSeconds),
+                        durationSeconds = durationSeconds,
+                        viewCountText = "Facebook Feature",
                         synopsis = snippet,
                         aiTools = detectAiTools("$rawTitle $snippet"),
                         publishedText = "Facebook",
-                        ratingScore = 8.8f,
+                        ratingScore = 8.9f,
                         isFeatured = false,
                         isScrapedLive = true,
                         addedAt = now - (discovered.size * 50L)
@@ -344,41 +508,10 @@ class AiMovieScraperEngine(
             }
         }
 
-        // 3. Ensure at least a direct playable profile videos hub entry exists if Facebook gated listing behind login
-        if (discovered.isEmpty()) {
-            val videosTabUrl = if (profileUrl.contains("profile.php")) {
-                "$profileUrl&sk=videos"
-            } else {
-                "${profileUrl.trimEnd('/')}/videos"
-            }
-            val genre = if (preferredGenre != MovieGenre.ALL) preferredGenre else classifyGenre(profileName, ogDesc, MovieGenre.SCI_FI)
-            discovered.add(
-                AiMovieEntity(
-                    id = "fb_prof_feed_${abs(profileUrl.lowercase().hashCode())}",
-                    title = "$profileName — Facebook Video Feed",
-                    director = profileName,
-                    source = MovieSource.FACEBOOK.name,
-                    videoId = "",
-                    watchUrl = videosTabUrl,
-                    thumbnailUrl = ogAvatar,
-                    genre = genre.name,
-                    durationText = "Feed",
-                    durationSeconds = 300,
-                    viewCountText = "Facebook Profile",
-                    synopsis = ogDesc.ifBlank {
-                        "Direct Facebook videos feed for $profileName. Open inside the Web Player or Facebook app to browse and stream uploads."
-                    },
-                    aiTools = detectAiTools("$profileName $ogDesc"),
-                    publishedText = "Followed Profile",
-                    ratingScore = 8.7f,
-                    isFeatured = false,
-                    isScrapedLive = true,
-                    addedAt = now
-                )
-            )
-        }
+        val uniqueMovies = discovered
+            .filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+            .distinctBy { it.id }
 
-        val uniqueMovies = discovered.distinctBy { it.id }
         val stableId = "fb_prof_${abs(profileUrl.lowercase().hashCode())}"
         val channelEntity = CreatorChannelEntity(
             id = stableId,
@@ -393,52 +526,142 @@ class AiMovieScraperEngine(
             addedAt = now
         )
 
+        val note = when {
+            uniqueMovies.isEmpty() && skippedShort > 0 ->
+                "Saved ${channelEntity.name}, but skipped $skippedShort videos under 45 minutes or without verified >45m duration."
+            uniqueMovies.isEmpty() ->
+                "Saved ${channelEntity.name}, but no public Facebook movies longer than 45 minutes were detected."
+            skippedShort > 0 ->
+                "Added ${channelEntity.name}: ${uniqueMovies.size} feature movies (>45m) imported, $skippedShort shorter videos filtered out."
+            else -> null
+        }
+
         Result.success(
             ChannelScrapeResult(
                 channel = channelEntity,
-                movies = uniqueMovies
+                movies = uniqueMovies,
+                skippedUnderMinDuration = skippedShort,
+                note = note
             )
         )
     }
 
-    suspend fun scrapeYouTubeByQuery(
+    /**
+     * Scrapes metadata from a user-provided YouTube or Facebook video URL and enforces the >45 minute rule.
+     */
+    suspend fun scrapeSingleUrl(rawUrl: String): Result<AiMovieEntity> = withContext(Dispatchers.IO) {
+        val url = rawUrl.trim()
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            return@withContext Result.failure(IllegalArgumentException("Enter a valid https:// YouTube or Facebook URL."))
+        }
+
+        val isYouTube = url.contains("youtube.com", ignoreCase = true) ||
+            url.contains("youtu.be", ignoreCase = true)
+        val isFacebook = url.contains("facebook.com", ignoreCase = true) ||
+            url.contains("fb.watch", ignoreCase = true)
+        if (!isYouTube && !isFacebook) {
+            return@withContext Result.failure(IllegalArgumentException("Only YouTube and Facebook video URLs are supported."))
+        }
+
+        val html = fetchHtml(url)
+
+        val ogTitle = extractMetaContent(html, "og:title")
+            ?: extractHtmlTitle(html)
+            ?: if (isYouTube) "Imported YouTube AI Movie" else "Imported Facebook AI Movie"
+        val ogDesc = extractMetaContent(html, "og:description")
+            ?: "Imported AI feature film scraped directly from ${if (isYouTube) "YouTube" else "Facebook"}."
+        val ogImage = extractMetaContent(html, "og:image").orEmpty()
+
+        val durationSeconds = extractDurationSecondsFromHtml(html)
+            .takeIf { it > 0 }
+            ?: extractDurationSecondsFromText("$ogTitle $ogDesc")
+
+        val cleanDisplayTitle = cleanTitle(
+            ogTitle
+                .replace(" - YouTube", "", ignoreCase = true)
+                .replace(" | Facebook", "", ignoreCase = true)
+        )
+
+        if (durationSeconds <= MIN_FEATURE_DURATION_SECONDS) {
+            val foundText = if (durationSeconds > 0) formatSecondsToDuration(durationSeconds) else "unknown length"
+            return@withContext Result.failure(
+                IllegalArgumentException(
+                    "Filtered out: \"$cleanDisplayTitle\" ($foundText). Only movies longer than 45 minutes can be added."
+                )
+            )
+        }
+
+        val ytId = if (isYouTube) extractYouTubeVideoId(url) else ""
+        val fbId = if (isFacebook) extractFacebookVideoId(url) else ""
+        val finalThumb = when {
+            ytId.length == 11 -> "https://i.ytimg.com/vi/$ytId/hqdefault.jpg"
+            ogImage.startsWith("https://") -> ogImage
+            else -> ""
+        }
+
+        val genre = classifyGenre(cleanDisplayTitle, ogDesc, MovieGenre.SCI_FI)
+        val tools = detectAiTools("$cleanDisplayTitle $ogDesc")
+
+        Result.success(
+            AiMovieEntity(
+                id = if (ytId.isNotBlank()) "yt_$ytId" else "imp_${abs(url.hashCode())}",
+                title = cleanDisplayTitle,
+                director = if (isYouTube) "YouTube Creator" else "Facebook Creator",
+                source = if (isYouTube) MovieSource.YOUTUBE.name else MovieSource.FACEBOOK.name,
+                videoId = if (isYouTube) ytId else fbId,
+                watchUrl = if (ytId.length == 11) "https://www.youtube.com/watch?v=$ytId" else url,
+                thumbnailUrl = finalThumb,
+                genre = genre.name,
+                durationText = formatSecondsToDuration(durationSeconds),
+                durationSeconds = durationSeconds,
+                viewCountText = "Imported Feature",
+                synopsis = ogDesc.take(260),
+                aiTools = tools,
+                publishedText = "Just Scraped",
+                ratingScore = 9.1f,
+                isFeatured = false,
+                isScrapedLive = true,
+                addedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
+    private suspend fun scrapeYouTubeByQueryInternal(
         query: String,
         preferredGenre: MovieGenre,
-        maxResults: Int = 8
-    ): List<AiMovieEntity> = withContext(Dispatchers.IO) {
+        maxResults: Int
+    ): ParsedRendererResult = withContext(Dispatchers.IO) {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val url = "https://www.youtube.com/results?search_query=$encoded"
+        // Apply YouTube's native >20m long-video filter (sp=EgIYAg%3D%3D) to surface full-length feature movies
+        val url = "https://www.youtube.com/results?search_query=$encoded&sp=$YOUTUBE_LONG_VIDEO_SP"
         val html = fetchHtml(url)
-        if (html.isBlank()) return@withContext emptyList()
+        if (html.isBlank()) return@withContext ParsedRendererResult(emptyList(), 0)
 
         val initialDataJson = extractBalancedJson(html, "var ytInitialData = ")
             ?: extractBalancedJson(html, "window[\"ytInitialData\"] = ")
-            ?: return@withContext emptyList()
+            ?: return@withContext ParsedRendererResult(emptyList(), 0)
 
         val root = JSONObject(initialDataJson)
         val renderers = mutableListOf<JSONObject>()
-        collectVideoRenderers(root, renderers, maxCount = maxResults * 2)
+        collectVideoRenderers(root, renderers, maxCount = 45)
 
         parseVideoRenderers(
             renderers = renderers,
             fallbackChannel = "Independent AI Studio",
             preferredGenre = preferredGenre,
-            maxResults = maxResults,
-            allowShortClips = false
+            maxResults = maxResults
         )
     }
 
-    /**
-     * Discovers public Facebook Watch / Video AI short films via public search listings.
-     */
-    suspend fun scrapeFacebookAiVideos(maxResults: Int = 8): List<AiMovieEntity> =
+    private suspend fun scrapeFacebookAiVideosInternal(maxResults: Int): ParsedRendererResult =
         withContext(Dispatchers.IO) {
             val queries = listOf(
-                "site:facebook.com/watch AI short film movie",
-                "site:facebook.com AI generated short film sci-fi horror video"
+                "site:facebook.com/watch AI full movie",
+                "site:facebook.com AI generated full movie sci-fi OR fantasy OR horror"
             )
             val found = mutableListOf<AiMovieEntity>()
             val seenUrls = mutableSetOf<String>()
+            var skippedShort = 0
             val now = System.currentTimeMillis()
 
             for (query in queries) {
@@ -471,7 +694,18 @@ class AiMovieScraperEngine(
 
                     val snippet = snippets.getOrNull(idx)
                         ?.takeIf { it.isNotBlank() }
-                        ?: "AI-generated film discovered on Facebook Watch."
+                        ?: "AI-generated feature film discovered on Facebook Watch."
+
+                    var durationSeconds = extractDurationSecondsFromText("$rawTitle $snippet")
+                    if (durationSeconds == 0) {
+                        val videoHtml = fetchHtml(resolvedUrl)
+                        durationSeconds = extractDurationSecondsFromHtml(videoHtml)
+                    }
+
+                    if (durationSeconds <= MIN_FEATURE_DURATION_SECONDS) {
+                        skippedShort++
+                        return@forEachIndexed
+                    }
 
                     val genre = classifyGenre(rawTitle, snippet, MovieGenre.SCI_FI)
                     val tools = detectAiTools("$rawTitle $snippet")
@@ -487,13 +721,13 @@ class AiMovieScraperEngine(
                             watchUrl = resolvedUrl,
                             thumbnailUrl = "",
                             genre = genre.name,
-                            durationText = "04:30",
-                            durationSeconds = 270,
-                            viewCountText = "Facebook Watch",
+                            durationText = formatSecondsToDuration(durationSeconds),
+                            durationSeconds = durationSeconds,
+                            viewCountText = "Facebook Feature",
                             synopsis = snippet,
                             aiTools = tools,
                             publishedText = "Facebook",
-                            ratingScore = 8.7f,
+                            ratingScore = 8.9f,
                             isFeatured = false,
                             isScrapedLive = true,
                             addedAt = now - (idx * 75L)
@@ -502,142 +736,18 @@ class AiMovieScraperEngine(
                 }
             }
 
-            found
+            ParsedRendererResult(found, skippedShort)
         }
-
-    /**
-     * Scrapes metadata (title, thumbnail, synopsis, genre) from any user-provided YouTube or Facebook video URL.
-     */
-    suspend fun scrapeSingleUrl(rawUrl: String): AiMovieEntity? = withContext(Dispatchers.IO) {
-        val url = rawUrl.trim()
-        if (!url.startsWith("http://") && !url.startsWith("https://")) return@withContext null
-
-        val isYouTube = url.contains("youtube.com", ignoreCase = true) ||
-            url.contains("youtu.be", ignoreCase = true)
-        val isFacebook = url.contains("facebook.com", ignoreCase = true) ||
-            url.contains("fb.watch", ignoreCase = true)
-        if (!isYouTube && !isFacebook) return@withContext null
-
-        val html = fetchHtml(url)
-
-        val ogTitle = extractMetaContent(html, "og:title")
-            ?: extractHtmlTitle(html)
-            ?: if (isYouTube) "Imported YouTube AI Film" else "Imported Facebook AI Film"
-        val ogDesc = extractMetaContent(html, "og:description")
-            ?: "Imported AI movie scraped directly from ${if (isYouTube) "YouTube" else "Facebook"}."
-        val ogImage = extractMetaContent(html, "og:image").orEmpty()
-
-        val ytId = if (isYouTube) extractYouTubeVideoId(url) else ""
-        val fbId = if (isFacebook) extractFacebookVideoId(url) else ""
-        val finalThumb = when {
-            ytId.length == 11 -> "https://i.ytimg.com/vi/$ytId/hqdefault.jpg"
-            ogImage.startsWith("https://") -> ogImage
-            else -> ""
-        }
-
-        val genre = classifyGenre(ogTitle, ogDesc, MovieGenre.SCI_FI)
-        val tools = detectAiTools("$ogTitle $ogDesc")
-
-        AiMovieEntity(
-            id = if (ytId.isNotBlank()) "yt_$ytId" else "imp_${abs(url.hashCode())}",
-            title = cleanTitle(
-                ogTitle
-                    .replace(" - YouTube", "", ignoreCase = true)
-                    .replace(" | Facebook", "", ignoreCase = true)
-            ),
-            director = if (isYouTube) "YouTube Creator" else "Facebook Creator",
-            source = if (isYouTube) MovieSource.YOUTUBE.name else MovieSource.FACEBOOK.name,
-            videoId = if (isYouTube) ytId else fbId,
-            watchUrl = if (ytId.length == 11) "https://www.youtube.com/watch?v=$ytId" else url,
-            thumbnailUrl = finalThumb,
-            genre = genre.name,
-            durationText = "05:00",
-            durationSeconds = 300,
-            viewCountText = "Imported",
-            synopsis = ogDesc.take(260),
-            aiTools = tools,
-            publishedText = "Just Scraped",
-            ratingScore = 9.0f,
-            isFeatured = false,
-            isScrapedLive = true,
-            addedAt = System.currentTimeMillis()
-        )
-    }
-
-    private fun scrapeYouTubeChannelRss(
-        channelId: String,
-        fallbackChannelName: String,
-        preferredGenre: MovieGenre
-    ): List<AiMovieEntity> {
-        val xml = fetchHtml("https://www.youtube.com/feeds/videos.xml?channel_id=$channelId")
-        if (xml.isBlank()) return emptyList()
-
-        val entryRegex = Regex("<entry>(.*?)</entry>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
-        val videoIdRegex = Regex("<yt:videoId>([^<]+)</yt:videoId>")
-        val titleRegex = Regex("<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL)
-        val authorRegex = Regex("<name>(.*?)</name>", RegexOption.DOT_MATCHES_ALL)
-        val descRegex = Regex("<media:description>(.*?)</media:description>", RegexOption.DOT_MATCHES_ALL)
-
-        val now = System.currentTimeMillis()
-        val list = mutableListOf<AiMovieEntity>()
-
-        entryRegex.findAll(xml).forEachIndexed { idx, match ->
-            if (list.size >= 15) return@forEachIndexed
-            val block = match.groupValues[1]
-            val vid = videoIdRegex.find(block)?.groupValues?.getOrNull(1)?.trim().orEmpty()
-            if (vid.length != 11) return@forEachIndexed
-
-            val title = stripHtml(titleRegex.find(block)?.groupValues?.getOrNull(1).orEmpty())
-            if (title.isBlank()) return@forEachIndexed
-
-            val author = stripHtml(authorRegex.find(block)?.groupValues?.getOrNull(1).orEmpty())
-                .ifBlank { fallbackChannelName }
-            val desc = stripHtml(descRegex.find(block)?.groupValues?.getOrNull(1).orEmpty())
-                .take(260)
-                .ifBlank { "Uploaded by $author on YouTube." }
-
-            val genre = if (preferredGenre != MovieGenre.ALL) {
-                preferredGenre
-            } else {
-                classifyGenre(title, desc, MovieGenre.SCI_FI)
-            }
-            val tools = detectAiTools("$title $desc $author")
-
-            list.add(
-                AiMovieEntity(
-                    id = "yt_$vid",
-                    title = cleanTitle(title),
-                    director = author,
-                    source = MovieSource.YOUTUBE.name,
-                    videoId = vid,
-                    watchUrl = "https://www.youtube.com/watch?v=$vid",
-                    thumbnailUrl = "https://i.ytimg.com/vi/$vid/hqdefault.jpg",
-                    genre = genre.name,
-                    durationText = "04:00",
-                    durationSeconds = 240,
-                    viewCountText = "Channel Upload",
-                    synopsis = desc,
-                    aiTools = tools,
-                    publishedText = "YouTube Channel",
-                    ratingScore = 9.0f,
-                    isFeatured = false,
-                    isScrapedLive = true,
-                    addedAt = now - (idx * 60L)
-                )
-            )
-        }
-        return list
-    }
 
     private fun parseVideoRenderers(
         renderers: List<JSONObject>,
         fallbackChannel: String,
         preferredGenre: MovieGenre,
-        maxResults: Int,
-        allowShortClips: Boolean
-    ): List<AiMovieEntity> {
+        maxResults: Int
+    ): ParsedRendererResult {
         val now = System.currentTimeMillis()
         val results = mutableListOf<AiMovieEntity>()
+        var skippedShort = 0
 
         for ((index, renderer) in renderers.withIndex()) {
             if (results.size >= maxResults) break
@@ -647,25 +757,28 @@ class AiMovieScraperEngine(
             val title = readTextField(renderer.optJSONObject("title")).trim()
             if (title.isBlank()) continue
 
+            val durationText = readTextField(renderer.optJSONObject("lengthText")).trim()
+            val durationSeconds = parseDurationToSeconds(durationText)
+            // Strict filter rule: only add movies strictly longer than 45 minutes (2700s)
+            if (durationSeconds <= MIN_FEATURE_DURATION_SECONDS) {
+                skippedShort++
+                continue
+            }
+
             val channel = readTextField(renderer.optJSONObject("ownerText"))
                 .ifBlank { readTextField(renderer.optJSONObject("longBylineText")) }
                 .ifBlank { fallbackChannel }
 
-            val durationText = readTextField(renderer.optJSONObject("lengthText"))
-                .ifBlank { "04:00" }
-            val durationSeconds = parseDurationToSeconds(durationText)
-            if (!allowShortClips && durationSeconds < 30) continue
-
             val viewCountText = readTextField(renderer.optJSONObject("shortViewCountText"))
                 .ifBlank { readTextField(renderer.optJSONObject("viewCountText")) }
-                .ifBlank { "YouTube AI Film" }
+                .ifBlank { "YouTube Feature" }
 
             val publishedText = readTextField(renderer.optJSONObject("publishedTimeText"))
                 .ifBlank { "YouTube" }
 
             val snippet = extractSnippetText(renderer)
                 .ifBlank {
-                    "AI-generated film from $channel on YouTube."
+                    "Full-length AI-generated feature film ($durationText) from $channel on YouTube."
                 }
 
             val detectedGenre = if (preferredGenre != MovieGenre.ALL) {
@@ -693,13 +806,86 @@ class AiMovieScraperEngine(
                     aiTools = detectedTools,
                     publishedText = publishedText,
                     ratingScore = score,
-                    isFeatured = index == 0 && preferredGenre == MovieGenre.SCI_FI,
+                    isFeatured = results.isEmpty() && preferredGenre == MovieGenre.SCI_FI,
                     isScrapedLive = true,
                     addedAt = now - (index * 50L)
                 )
             )
         }
-        return results
+        return ParsedRendererResult(results, skippedShort)
+    }
+
+    private fun extractDurationSecondsFromHtml(html: String): Int {
+        if (html.isBlank()) return 0
+
+        // YouTube JSON lengthSeconds
+        Regex(""""lengthSeconds"\s*:\s*"(\d+)"""").find(html)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
+            if (it > 0) return it
+        }
+        // YouTube approxDurationMs
+        Regex(""""approxDurationMs"\s*:\s*"(\d+)"""").find(html)?.groupValues?.getOrNull(1)?.toLongOrNull()?.let {
+            val sec = (it / 1000L).toInt()
+            if (sec > 0) return sec
+        }
+        // Facebook playable_duration_in_ms
+        Regex(""""playable_duration_in_ms"\s*:\s*(\d+)""").find(html)?.groupValues?.getOrNull(1)?.toLongOrNull()?.let {
+            val sec = (it / 1000L).toInt()
+            if (sec > 0) return sec
+        }
+        // OpenGraph / Schema.org duration meta tags
+        val metaDuration = extractMetaContent(html, "video:duration")
+            ?: extractMetaContent(html, "duration")
+        if (!metaDuration.isNullOrBlank()) {
+            metaDuration.toIntOrNull()?.let { if (it > 0) return it }
+            val iso = parseIso8601Duration(metaDuration)
+            if (iso > 0) return iso
+        }
+        return 0
+    }
+
+    private fun parseIso8601Duration(iso: String): Int {
+        val match = Regex("""PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?""", RegexOption.IGNORE_CASE).find(iso)
+            ?: return 0
+        val h = match.groupValues[1].toIntOrNull() ?: 0
+        val m = match.groupValues[2].toIntOrNull() ?: 0
+        val s = match.groupValues[3].toIntOrNull() ?: 0
+        return h * 3600 + m * 60 + s
+    }
+
+    private fun extractDurationSecondsFromText(text: String): Int {
+        // Match HH:MM:SS timestamps like 1:14:22
+        Regex("""\b(\d{1,2}):([0-5]\d):([0-5]\d)\b""").find(text)?.let { m ->
+            val h = m.groupValues[1].toIntOrNull() ?: 0
+            val min = m.groupValues[2].toIntOrNull() ?: 0
+            val s = m.groupValues[3].toIntOrNull() ?: 0
+            return h * 3600 + min * 60 + s
+        }
+        // Match "1h 20m" or "1 hr 15 min"
+        Regex("""\b(\d+)\s*(?:h|hr|hrs|hour|hours)\s*(?:(\d+)\s*(?:m|min|mins|minute|minutes))?""", RegexOption.IGNORE_CASE)
+            .find(text)?.let { m ->
+                val h = m.groupValues[1].toIntOrNull() ?: 0
+                val min = m.groupValues[2].toIntOrNull() ?: 0
+                if (h > 0) return h * 3600 + min * 60
+            }
+        // Match "74 min" / "60 minutes"
+        Regex("""\b(\d{2,3})\s*(?:min|mins|minute|minutes)\b""", RegexOption.IGNORE_CASE)
+            .find(text)?.let { m ->
+                val min = m.groupValues[1].toIntOrNull() ?: 0
+                if (min > 0) return min * 60
+            }
+        return 0
+    }
+
+    private fun formatSecondsToDuration(totalSeconds: Int): String {
+        val safe = totalSeconds.coerceAtLeast(0)
+        val hours = safe / 3600
+        val minutes = (safe % 3600) / 60
+        val seconds = safe % 60
+        return if (hours > 0) {
+            String.format("%d:%02d:%02d", hours, minutes, seconds)
+        } else {
+            String.format("%d:%02d", minutes, seconds)
+        }
     }
 
     private fun fetchHtml(url: String): String = runCatching {
@@ -816,6 +1002,161 @@ class AiMovieScraperEngine(
         }
     }
 
+    private fun collectChannelRenderers(node: Any?, out: MutableList<JSONObject>, maxCount: Int) {
+        if (node == null || out.size >= maxCount) return
+        when (node) {
+            is JSONObject -> {
+                val renderer = node.optJSONObject("channelRenderer")
+                if (renderer != null) {
+                    out.add(renderer)
+                    return
+                }
+                val keys = node.keys()
+                while (keys.hasNext() && out.size < maxCount) {
+                    val key = keys.next()
+                    collectChannelRenderers(node.opt(key), out, maxCount)
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until node.length()) {
+                    if (out.size >= maxCount) break
+                    collectChannelRenderers(node.opt(i), out, maxCount)
+                }
+            }
+        }
+    }
+
+    private fun parseChannelRenderers(
+        renderers: List<JSONObject>,
+        maxResults: Int
+    ): List<YouTubeChannelSearchResult> {
+        val results = mutableListOf<YouTubeChannelSearchResult>()
+        for (renderer in renderers) {
+            if (results.size >= maxResults) break
+            val channelId = renderer.optString("channelId").trim()
+            val name = readTextField(renderer.optJSONObject("title")).trim()
+            if (name.isBlank()) continue
+
+            val browseEndpoint = renderer.optJSONObject("navigationEndpoint")
+                ?.optJSONObject("browseEndpoint")
+            val canonicalBase = browseEndpoint?.optString("canonicalBaseUrl").orEmpty().trim()
+            val resolvedId = channelId.ifBlank { browseEndpoint?.optString("browseId").orEmpty().trim() }
+
+            val channelUrl = when {
+                canonicalBase.startsWith("/") -> "https://www.youtube.com$canonicalBase"
+                resolvedId.startsWith("UC") -> "https://www.youtube.com/channel/$resolvedId"
+                else -> continue
+            }
+
+            val subText = readTextField(renderer.optJSONObject("subscriberCountText")).trim()
+            val videoCountText = readTextField(renderer.optJSONObject("videoCountText")).trim()
+
+            // YouTube's newer channelRenderer puts @handle in subscriberCountText and subscriber count in videoCountText
+            val handle = when {
+                canonicalBase.startsWith("/@") -> canonicalBase.removePrefix("/")
+                subText.startsWith("@") -> subText
+                else -> ""
+            }
+
+            val statsParts = listOf(subText, videoCountText)
+                .filter { it.isNotBlank() && !it.startsWith("@") }
+                .distinct()
+            val statsText = statsParts.joinToString(" • ").ifBlank { "YouTube Channel" }
+
+            val description = readTextField(renderer.optJSONObject("descriptionSnippet"))
+                .trim()
+                .ifBlank { "YouTube creator channel discovered via keyword search." }
+
+            val avatarUrl = extractBestThumbnailUrl(renderer.optJSONObject("thumbnail"))
+
+            results.add(
+                YouTubeChannelSearchResult(
+                    channelId = resolvedId.ifBlank { "yt_srch_${abs(channelUrl.hashCode())}" },
+                    name = cleanTitle(name),
+                    handle = handle,
+                    channelUrl = channelUrl,
+                    avatarUrl = avatarUrl,
+                    statsText = statsText,
+                    description = description
+                )
+            )
+        }
+        return results
+    }
+
+    private fun extractChannelsFromVideoRenderers(
+        videoRenderers: List<JSONObject>,
+        maxResults: Int
+    ): List<YouTubeChannelSearchResult> {
+        if (maxResults <= 0) return emptyList()
+        val results = mutableListOf<YouTubeChannelSearchResult>()
+        val seenIds = mutableSetOf<String>()
+
+        for (renderer in videoRenderers) {
+            if (results.size >= maxResults) break
+            val ownerObj = renderer.optJSONObject("ownerText")
+                ?: renderer.optJSONObject("longBylineText")
+                ?: continue
+            val ownerName = readTextField(ownerObj).trim()
+            if (ownerName.isBlank()) continue
+
+            val firstRun = ownerObj.optJSONArray("runs")?.optJSONObject(0)
+            val browse = firstRun?.optJSONObject("navigationEndpoint")?.optJSONObject("browseEndpoint")
+            val browseId = browse?.optString("browseId").orEmpty().trim()
+            val canonicalBase = browse?.optString("canonicalBaseUrl").orEmpty().trim()
+
+            val channelUrl = when {
+                canonicalBase.startsWith("/") -> "https://www.youtube.com$canonicalBase"
+                browseId.startsWith("UC") -> "https://www.youtube.com/channel/$browseId"
+                else -> continue
+            }
+
+            val dedupeKey = browseId.ifBlank { channelUrl.lowercase() }
+            if (!seenIds.add(dedupeKey)) continue
+
+            val handle = if (canonicalBase.startsWith("/@")) canonicalBase.removePrefix("/") else ""
+            val avatarThumbObj = renderer
+                .optJSONObject("channelThumbnailSupportedRenderers")
+                ?.optJSONObject("channelThumbnailWithLinkRenderer")
+                ?.optJSONObject("thumbnail")
+            val avatarUrl = extractBestThumbnailUrl(avatarThumbObj)
+
+            val sampleTitle = readTextField(renderer.optJSONObject("title")).trim()
+            val sampleDuration = readTextField(renderer.optJSONObject("lengthText")).trim()
+            val desc = if (sampleTitle.isNotBlank()) {
+                val durPart = if (sampleDuration.isNotBlank()) " ($sampleDuration)" else ""
+                "Publishes: $sampleTitle$durPart"
+            } else {
+                "Channel publishing long-form videos matching your keywords."
+            }
+
+            results.add(
+                YouTubeChannelSearchResult(
+                    channelId = browseId.ifBlank { "yt_vidch_${abs(channelUrl.hashCode())}" },
+                    name = cleanTitle(ownerName),
+                    handle = handle,
+                    channelUrl = channelUrl,
+                    avatarUrl = avatarUrl,
+                    statsText = "Matched via long videos",
+                    description = desc
+                )
+            )
+        }
+        return results
+    }
+
+    private fun extractBestThumbnailUrl(thumbnailObj: JSONObject?): String {
+        val thumbs = thumbnailObj?.optJSONArray("thumbnails") ?: return ""
+        if (thumbs.length() == 0) return ""
+        val raw = thumbs.optJSONObject(thumbs.length() - 1)?.optString("url").orEmpty().trim()
+        return when {
+            raw.startsWith("//") -> "https:$raw"
+            raw.startsWith("http://") -> raw.replaceFirst("http://", "https://")
+            raw.startsWith("https://") -> raw
+            else -> ""
+        }
+    }
+
     private fun readTextField(obj: JSONObject?): String {
         if (obj == null) return ""
         val simple = obj.optString("simpleText")
@@ -839,12 +1180,13 @@ class AiMovieScraperEngine(
     }
 
     private fun parseDurationToSeconds(duration: String): Int {
+        if (duration.isBlank()) return 0
         val parts = duration.trim().split(":").mapNotNull { it.toIntOrNull() }
         return when (parts.size) {
             3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
             2 -> parts[0] * 60 + parts[1]
             1 -> parts[0]
-            else -> 240
+            else -> 0
         }
     }
 
@@ -894,11 +1236,11 @@ class AiMovieScraperEngine(
     }
 
     private fun estimateQualityScore(views: String, durationSeconds: Int, tools: String): Float {
-        var score = 8.4f
+        var score = 8.5f
         val lower = views.lowercase()
         if (lower.contains("m")) score += 0.8f
         else if (lower.contains("k")) score += 0.4f
-        if (durationSeconds in 120..1200) score += 0.3f
+        if (durationSeconds >= 3600) score += 0.3f
         if (tools != "Generative AI Cinema") score += 0.2f
         return score.coerceAtMost(9.8f)
     }
@@ -930,14 +1272,14 @@ class AiMovieScraperEngine(
 
     private fun extractMetaContent(html: String, property: String): String? {
         val pattern = Regex(
-            """<meta[^>]+(?:property|name)=["']$property["'][^>]+content=["']([^"']+)["']""",
+            """<meta[^>]+(?:property|name|itemprop)=["']$property["'][^>]+content=["']([^"']+)["']""",
             RegexOption.IGNORE_CASE
         )
         val direct = pattern.find(html)?.groupValues?.getOrNull(1)
         if (!direct.isNullOrBlank()) return stripHtml(direct)
 
         val reversed = Regex(
-            """<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']$property["']""",
+            """<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name|itemprop)=["']$property["']""",
             RegexOption.IGNORE_CASE
         )
         return reversed.find(html)?.groupValues?.getOrNull(1)?.let { stripHtml(it) }

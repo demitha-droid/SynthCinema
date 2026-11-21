@@ -5,12 +5,15 @@ import com.example.data.local.StarterCatalog
 import com.example.data.model.AiMovieEntity
 import com.example.data.model.ChannelScrapeResult
 import com.example.data.model.CreatorChannelEntity
+import com.example.data.model.MIN_FEATURE_DURATION_SECONDS
 import com.example.data.model.MovieGenre
 import com.example.data.model.MovieSource
 import com.example.data.model.MovieWithHistory
 import com.example.data.model.ScrapeReport
 import com.example.data.model.WatchHistoryEntity
+import com.example.data.model.YouTubeChannelSearchResult
 import com.example.data.remote.AiMovieScraperEngine
+import com.example.data.remote.YouTubeMovieSearchBatch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 
@@ -20,7 +23,7 @@ class CinemaRepository(
 ) {
 
     val moviesWithHistory: Flow<List<MovieWithHistory>> = combine(
-        dao.observeAllMovies(),
+        dao.observeAllMovies(MIN_FEATURE_DURATION_SECONDS),
         dao.observeAllHistory()
     ) { movies, historyList ->
         val historyMap = historyList.associateBy { it.movieId }
@@ -42,7 +45,13 @@ class CinemaRepository(
     }
 
     suspend fun ensureSeeded() {
-        dao.insertMoviesIgnoreConflict(StarterCatalog.initialMovies())
+        // Enforce the >45 minute filter rule on any previously cached short movies in Room
+        dao.pruneShortMovies(MIN_FEATURE_DURATION_SECONDS)
+        val validStarters = StarterCatalog.initialMovies()
+            .filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+        if (validStarters.isNotEmpty()) {
+            dao.insertMoviesIgnoreConflict(validStarters)
+        }
     }
 
     suspend fun scrapeFreshMovies(genreFilter: MovieGenre = MovieGenre.ALL): ScrapeReport {
@@ -52,19 +61,22 @@ class CinemaRepository(
             listOf(genreFilter)
         }
 
-        val (scraped, errorNote) = scraper.scrapeAllPlatforms(targetGenres)
-        val combined = scraped.toMutableList()
+        val batch = scraper.scrapeAllPlatforms(targetGenres)
+        val combined = batch.movies.toMutableList()
+        var skippedShort = batch.skippedUnderMinDuration
 
         // Also sync all user-followed YouTube channels and Facebook profiles
         val followed = dao.getAllChannels()
         for (channel in followed) {
             val res = scrapeChannelInternal(channel.source, channel.handleOrUrl, channel.preferredGenre)
             res.getOrNull()?.let { result ->
-                if (result.movies.isNotEmpty()) {
-                    combined.addAll(result.movies)
+                skippedShort += result.skippedUnderMinDuration
+                val validChannelMovies = result.movies.filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+                if (validChannelMovies.isNotEmpty()) {
+                    combined.addAll(validChannelMovies)
                     dao.upsertChannel(
                         channel.copy(
-                            moviesImportedCount = maxOf(channel.moviesImportedCount, result.movies.size),
+                            moviesImportedCount = maxOf(channel.moviesImportedCount, validChannelMovies.size),
                             lastSyncedAt = System.currentTimeMillis()
                         )
                     )
@@ -72,7 +84,9 @@ class CinemaRepository(
             }
         }
 
-        val unique = combined.distinctBy { it.id }
+        val unique = combined
+            .filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+            .distinctBy { it.id }
         if (unique.isNotEmpty()) {
             dao.insertMovies(unique)
         }
@@ -82,8 +96,25 @@ class CinemaRepository(
             totalAdded = unique.size,
             youtubeFound = ytCount,
             facebookFound = fbCount,
-            errorNote = errorNote
+            skippedUnderMinDuration = skippedShort,
+            errorNote = batch.errorNote
         )
+    }
+
+    suspend fun searchYouTubeChannels(keyword: String): Result<List<YouTubeChannelSearchResult>> =
+        scraper.searchYouTubeChannels(keyword)
+
+    suspend fun searchYouTubeAiMovies(keyword: String): Result<YouTubeMovieSearchBatch> =
+        scraper.searchYouTubeAiMovies(keyword)
+
+    suspend fun saveMoviesToVault(movies: List<AiMovieEntity>): Int {
+        val valid = movies
+            .filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+            .distinctBy { it.id }
+        if (valid.isNotEmpty()) {
+            dao.insertMovies(valid)
+        }
+        return valid.size
     }
 
     suspend fun addAndScrapeChannel(
@@ -93,28 +124,56 @@ class CinemaRepository(
     ): Result<ChannelScrapeResult> {
         val result = scrapeChannelInternal(source.name, handleOrUrl, preferredGenre)
         return result.map { scrapeResult ->
-            dao.upsertChannel(scrapeResult.channel)
-            if (scrapeResult.movies.isNotEmpty()) {
-                dao.insertMovies(scrapeResult.movies)
+            val validMovies = scrapeResult.movies.filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+            val updatedChannel = scrapeResult.channel.copy(moviesImportedCount = validMovies.size)
+            dao.upsertChannel(updatedChannel)
+            if (validMovies.isNotEmpty()) {
+                dao.insertMovies(validMovies)
             }
-            scrapeResult
+            scrapeResult.copy(channel = updatedChannel, movies = validMovies)
+        }
+    }
+
+    suspend fun addPickedYouTubeChannel(
+        candidate: YouTubeChannelSearchResult,
+        preferredGenre: MovieGenre
+    ): Result<ChannelScrapeResult> {
+        val result = scraper.scrapeYouTubeChannel(
+            rawInput = candidate.channelUrl,
+            preferredGenre = preferredGenre,
+            fallbackName = candidate.name,
+            fallbackAvatarUrl = candidate.avatarUrl
+        )
+        return result.map { scrapeResult ->
+            val validMovies = scrapeResult.movies.filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
+            val updatedChannel = scrapeResult.channel.copy(
+                name = scrapeResult.channel.name.ifBlank { candidate.name },
+                avatarUrl = scrapeResult.channel.avatarUrl.ifBlank { candidate.avatarUrl },
+                moviesImportedCount = validMovies.size
+            )
+            dao.upsertChannel(updatedChannel)
+            if (validMovies.isNotEmpty()) {
+                dao.insertMovies(validMovies)
+            }
+            scrapeResult.copy(channel = updatedChannel, movies = validMovies)
         }
     }
 
     suspend fun syncChannel(channel: CreatorChannelEntity): Result<ChannelScrapeResult> {
         val result = scrapeChannelInternal(channel.source, channel.handleOrUrl, channel.preferredGenre)
         return result.map { scrapeResult ->
+            val validMovies = scrapeResult.movies.filter { it.durationSeconds > MIN_FEATURE_DURATION_SECONDS }
             val updatedChannel = channel.copy(
                 name = scrapeResult.channel.name.ifBlank { channel.name },
                 avatarUrl = scrapeResult.channel.avatarUrl.ifBlank { channel.avatarUrl },
-                moviesImportedCount = maxOf(channel.moviesImportedCount, scrapeResult.movies.size),
+                moviesImportedCount = maxOf(channel.moviesImportedCount, validMovies.size),
                 lastSyncedAt = System.currentTimeMillis()
             )
             dao.upsertChannel(updatedChannel)
-            if (scrapeResult.movies.isNotEmpty()) {
-                dao.insertMovies(scrapeResult.movies)
+            if (validMovies.isNotEmpty()) {
+                dao.insertMovies(validMovies)
             }
-            scrapeResult.copy(channel = updatedChannel)
+            scrapeResult.copy(channel = updatedChannel, movies = validMovies)
         }
     }
 
@@ -145,12 +204,15 @@ class CinemaRepository(
     }
 
     suspend fun importMovieFromUrl(url: String): Result<AiMovieEntity> {
-        val scraped = scraper.scrapeSingleUrl(url)
-            ?: return Result.failure(
-                IllegalArgumentException("Please enter a valid YouTube or Facebook video URL.")
-            )
-        dao.insertMovie(scraped)
-        return Result.success(scraped)
+        return scraper.scrapeSingleUrl(url).mapCatching { scraped ->
+            if (scraped.durationSeconds <= MIN_FEATURE_DURATION_SECONDS) {
+                throw IllegalArgumentException(
+                    "Filtered out: \"${scraped.title}\" (${scraped.durationText}). Only movies longer than 45 minutes can be added."
+                )
+            }
+            dao.insertMovie(scraped)
+            scraped
+        }
     }
 
     suspend fun recordWatchStart(movieId: String) {
@@ -206,7 +268,7 @@ class CinemaRepository(
             existing.copy(
                 lastWatchedAt = System.currentTimeMillis(),
                 watchCount = existing.watchCount.coerceAtLeast(1),
-                watchedSeconds = if (nextCompleted) (movie?.durationSeconds ?: 300) else existing.watchedSeconds,
+                watchedSeconds = if (nextCompleted) (movie?.durationSeconds ?: 3000) else existing.watchedSeconds,
                 progressPercent = if (nextCompleted) 1f else 0.5f,
                 isCompleted = nextCompleted
             )

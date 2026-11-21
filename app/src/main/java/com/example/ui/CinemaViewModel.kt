@@ -6,11 +6,13 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.ai.AiCurationRepository
 import com.example.data.ai.CuratorAnalysisResult
 import com.example.data.ai.PlaceholderAiCurationRepository
+import com.example.data.model.AiMovieEntity
 import com.example.data.model.CreatorChannelEntity
 import com.example.data.model.MovieGenre
 import com.example.data.model.MovieSource
 import com.example.data.model.MovieWithHistory
 import com.example.data.model.TasteProfile
+import com.example.data.model.YouTubeChannelSearchResult
 import com.example.data.repository.CinemaRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -65,6 +67,28 @@ data class CuratorUiState(
     val error: String? = null
 )
 
+data class YouTubeChannelSearchUiState(
+    val keyword: String = "",
+    val isSearching: Boolean = false,
+    val hasSearched: Boolean = false,
+    val results: List<YouTubeChannelSearchResult> = emptyList(),
+    val selectedChannelIds: Set<String> = emptySet(),
+    val preferredGenre: MovieGenre = MovieGenre.ALL,
+    val isAddingSelected: Boolean = false,
+    val addingSingleChannelId: String? = null,
+    val error: String? = null
+)
+
+data class YouTubeMovieSearchUiState(
+    val query: String = "",
+    val executedQuery: String = "",
+    val isSearching: Boolean = false,
+    val hasSearched: Boolean = false,
+    val results: List<AiMovieEntity> = emptyList(),
+    val skippedUnderMinDuration: Int = 0,
+    val error: String? = null
+)
+
 private data class FilterParams(
     val query: String = "",
     val genre: MovieGenre = MovieGenre.ALL,
@@ -91,6 +115,12 @@ class CinemaViewModel(
 
     private val _curatorState = MutableStateFlow(CuratorUiState())
     val curatorState: StateFlow<CuratorUiState> = _curatorState.asStateFlow()
+
+    private val _channelSearchState = MutableStateFlow(YouTubeChannelSearchUiState())
+    val channelSearchState: StateFlow<YouTubeChannelSearchUiState> = _channelSearchState.asStateFlow()
+
+    private val _ytMovieSearchState = MutableStateFlow(YouTubeMovieSearchUiState())
+    val ytMovieSearchState: StateFlow<YouTubeMovieSearchUiState> = _ytMovieSearchState.asStateFlow()
 
     val uiState: StateFlow<CinemaUiState> = combine(
         repository.moviesWithHistory,
@@ -218,6 +248,90 @@ class CinemaViewModel(
         ops.update { it.copy(lastScrapeBanner = null) }
     }
 
+    fun onYouTubeMovieQueryChanged(query: String) {
+        _ytMovieSearchState.update { it.copy(query = query, error = null) }
+    }
+
+    fun clearYouTubeMovieSearch() {
+        _ytMovieSearchState.value = YouTubeMovieSearchUiState()
+    }
+
+    fun searchYouTubeForAiMovies(overrideQuery: String? = null) {
+        val raw = (overrideQuery ?: _ytMovieSearchState.value.query).trim()
+        if (raw.isEmpty() || _ytMovieSearchState.value.isSearching) return
+
+        viewModelScope.launch {
+            _ytMovieSearchState.update {
+                it.copy(
+                    query = raw,
+                    isSearching = true,
+                    error = null
+                )
+            }
+            val result = repository.searchYouTubeAiMovies(raw)
+            result.fold(
+                onSuccess = { batch ->
+                    val emptyNote = if (batch.movies.isEmpty()) {
+                        if (batch.skippedUnderMinDuration > 0) {
+                            "No AI movies >45m found for \"$raw\" (${batch.skippedUnderMinDuration} shorter clips filtered out)."
+                        } else {
+                            "No YouTube AI movies >45m found for \"$raw\". Try another keyword like \"sci-fi\", \"cyberpunk\", or \"fantasy\"."
+                        }
+                    } else {
+                        null
+                    }
+                    _ytMovieSearchState.update {
+                        it.copy(
+                            isSearching = false,
+                            hasSearched = true,
+                            executedQuery = batch.executedQuery,
+                            results = batch.movies,
+                            skippedUnderMinDuration = batch.skippedUnderMinDuration,
+                            error = emptyNote
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _ytMovieSearchState.update {
+                        it.copy(
+                            isSearching = false,
+                            hasSearched = true,
+                            results = emptyList(),
+                            error = err.message ?: "YouTube search failed."
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun saveYouTubeMovieToVault(movie: AiMovieEntity, onSaved: (String) -> Unit = {}) {
+        viewModelScope.launch {
+            val saved = repository.saveMoviesToVault(listOf(movie))
+            if (saved > 0) {
+                ops.update {
+                    it.copy(statusMessage = "Saved \"${movie.title}\" (${movie.durationText}) to your vault")
+                }
+                onSaved(movie.id)
+            } else {
+                ops.update {
+                    it.copy(statusMessage = "Could not save — only movies longer than 45 minutes are allowed.")
+                }
+            }
+        }
+    }
+
+    fun saveAllSearchedYouTubeMovies() {
+        val movies = _ytMovieSearchState.value.results
+        if (movies.isEmpty()) return
+        viewModelScope.launch {
+            val savedCount = repository.saveMoviesToVault(movies)
+            ops.update {
+                it.copy(statusMessage = "Saved $savedCount YouTube AI movies (>45m) to your vault")
+            }
+        }
+    }
+
     fun scrapeFreshMovies(
         genre: MovieGenre = filters.value.genre,
         silentIfFailed: Boolean = false
@@ -226,12 +340,19 @@ class CinemaViewModel(
         viewModelScope.launch {
             ops.update { it.copy(isScraping = true, statusMessage = null) }
             val report = repository.scrapeFreshMovies(genre)
+            val skippedSuffix = if (report.skippedUnderMinDuration > 0) {
+                " • ${report.skippedUnderMinDuration} under 45m filtered"
+            } else {
+                ""
+            }
             val banner = when {
                 report.totalAdded > 0 ->
-                    "Scraped ${report.totalAdded} live AI films (${report.youtubeFound} YouTube, ${report.facebookFound} Facebook)"
+                    "Scraped ${report.totalAdded} feature AI movies (>45m) (${report.youtubeFound} YT, ${report.facebookFound} FB)$skippedSuffix"
                 silentIfFailed -> null
                 report.errorNote != null -> report.errorNote
-                else -> "Vault is up to date — no new videos found right now."
+                report.skippedUnderMinDuration > 0 ->
+                    "No new movies >45m found (${report.skippedUnderMinDuration} shorter videos filtered out)."
+                else -> "Vault is up to date — no new feature movies (>45m) found right now."
             }
             ops.update {
                 it.copy(
@@ -285,10 +406,15 @@ class CinemaViewModel(
             val result = repository.syncChannel(channel)
             result.fold(
                 onSuccess = { res ->
+                    val defaultMsg = if (res.skippedUnderMinDuration > 0) {
+                        "Synced ${res.channel.name}: ${res.movies.size} movies (>45m) • ${res.skippedUnderMinDuration} shorter skipped"
+                    } else {
+                        "Synced ${res.channel.name}: ${res.movies.size} movies (>45m) updated"
+                    }
                     ops.update {
                         it.copy(
                             syncingChannelId = null,
-                            statusMessage = "Synced ${res.channel.name}: ${res.movies.size} movies updated"
+                            statusMessage = res.note ?: defaultMsg
                         )
                     }
                 },
@@ -313,9 +439,9 @@ class CinemaViewModel(
                 it.copy(
                     isScraping = false,
                     statusMessage = if (count > 0) {
-                        "Synced all channels — $count movies refreshed"
+                        "Synced all channels — $count feature movies (>45m) refreshed"
                     } else {
-                        "All followed channels are up to date"
+                        "All followed channels are up to date (only >45m movies saved)"
                     }
                 )
             }
@@ -329,6 +455,145 @@ class CinemaViewModel(
         }
     }
 
+    fun onYouTubeChannelKeywordChanged(keyword: String) {
+        _channelSearchState.update { it.copy(keyword = keyword, error = null) }
+    }
+
+    fun onYouTubeChannelSearchGenreChanged(genre: MovieGenre) {
+        _channelSearchState.update { it.copy(preferredGenre = genre) }
+    }
+
+    fun searchYouTubeChannels(overrideKeyword: String? = null) {
+        val query = (overrideKeyword ?: _channelSearchState.value.keyword).trim()
+        if (query.isEmpty() || _channelSearchState.value.isSearching) return
+
+        viewModelScope.launch {
+            _channelSearchState.update {
+                it.copy(
+                    keyword = query,
+                    isSearching = true,
+                    error = null,
+                    selectedChannelIds = emptySet()
+                )
+            }
+            val result = repository.searchYouTubeChannels(query)
+            result.fold(
+                onSuccess = { found ->
+                    _channelSearchState.update {
+                        it.copy(
+                            isSearching = false,
+                            hasSearched = true,
+                            results = found,
+                            error = if (found.isEmpty()) {
+                                "No YouTube channels found for \"$query\". Try broader keywords like \"AI movies\" or \"sci-fi full film\"."
+                            } else {
+                                null
+                            }
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _channelSearchState.update {
+                        it.copy(
+                            isSearching = false,
+                            hasSearched = true,
+                            error = err.message ?: "Failed to search YouTube channels."
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun toggleYouTubeChannelSelection(channelId: String) {
+        _channelSearchState.update { state ->
+            val updated = if (channelId in state.selectedChannelIds) {
+                state.selectedChannelIds - channelId
+            } else {
+                state.selectedChannelIds + channelId
+            }
+            state.copy(selectedChannelIds = updated)
+        }
+    }
+
+    fun clearYouTubeChannelSelection() {
+        _channelSearchState.update { it.copy(selectedChannelIds = emptySet()) }
+    }
+
+    fun addSingleSearchedYouTubeChannel(candidate: YouTubeChannelSearchResult) {
+        val state = _channelSearchState.value
+        if (state.isAddingSelected || state.addingSingleChannelId != null) return
+
+        viewModelScope.launch {
+            _channelSearchState.update { it.copy(addingSingleChannelId = candidate.channelId) }
+            val result = repository.addPickedYouTubeChannel(candidate, state.preferredGenre)
+            result.fold(
+                onSuccess = { scrapeRes ->
+                    val defaultMsg = if (scrapeRes.skippedUnderMinDuration > 0) {
+                        "Added ${scrapeRes.channel.name} to feed • ${scrapeRes.movies.size} movies (>45m), ${scrapeRes.skippedUnderMinDuration} shorter skipped"
+                    } else {
+                        "Added ${scrapeRes.channel.name} to feed • ${scrapeRes.movies.size} feature movies (>45m) imported"
+                    }
+                    _channelSearchState.update {
+                        it.copy(
+                            addingSingleChannelId = null,
+                            selectedChannelIds = it.selectedChannelIds - candidate.channelId
+                        )
+                    }
+                    ops.update { it.copy(statusMessage = scrapeRes.note ?: defaultMsg) }
+                },
+                onFailure = { err ->
+                    _channelSearchState.update { it.copy(addingSingleChannelId = null) }
+                    ops.update {
+                        it.copy(statusMessage = err.message ?: "Could not add ${candidate.name}.")
+                    }
+                }
+            )
+        }
+    }
+
+    fun addPickedYouTubeChannels() {
+        val state = _channelSearchState.value
+        if (state.isAddingSelected || state.selectedChannelIds.isEmpty()) return
+
+        val picked = state.results.filter { it.channelId in state.selectedChannelIds }
+        if (picked.isEmpty()) return
+
+        viewModelScope.launch {
+            _channelSearchState.update { it.copy(isAddingSelected = true) }
+            var addedChannels = 0
+            var totalMovies = 0
+            var totalSkippedShort = 0
+
+            for (candidate in picked) {
+                repository.addPickedYouTubeChannel(candidate, state.preferredGenre).onSuccess { res ->
+                    addedChannels++
+                    totalMovies += res.movies.size
+                    totalSkippedShort += res.skippedUnderMinDuration
+                }
+            }
+
+            _channelSearchState.update {
+                it.copy(
+                    isAddingSelected = false,
+                    selectedChannelIds = emptySet()
+                )
+            }
+
+            val skippedPart = if (totalSkippedShort > 0) {
+                " • $totalSkippedShort under 45m filtered"
+            } else {
+                ""
+            }
+            val msg = if (addedChannels > 0) {
+                "Added $addedChannels YouTube channel${if (addedChannels == 1) "" else "s"} to feed ($totalMovies feature movies >45m$skippedPart)"
+            } else {
+                "Could not import the selected YouTube channels right now."
+            }
+            ops.update { it.copy(statusMessage = msg) }
+        }
+    }
+
     fun importMovieUrl(url: String, onSuccess: (String) -> Unit = {}) {
         if (ops.value.isImportingUrl) return
         viewModelScope.launch {
@@ -339,7 +604,7 @@ class CinemaViewModel(
                     ops.update {
                         it.copy(
                             isImportingUrl = false,
-                            statusMessage = "Scraped \"${movie.title}\" into ${movie.movieGenre.displayName}"
+                            statusMessage = "Scraped \"${movie.title}\" (${movie.durationText}) into ${movie.movieGenre.displayName}"
                         )
                     }
                     onSuccess(movie.id)

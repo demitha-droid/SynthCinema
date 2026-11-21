@@ -6,14 +6,21 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.example.data.model.AiMovieEntity
 import com.example.data.model.CreatorChannelEntity
+import com.example.data.model.MIN_FEATURE_DURATION_SECONDS
 import com.example.data.model.WatchHistoryEntity
 import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface CinemaDao {
 
-    @Query("SELECT * FROM ai_movies ORDER BY isFeatured DESC, isScrapedLive DESC, ratingScore DESC, addedAt DESC")
-    fun observeAllMovies(): Flow<List<AiMovieEntity>>
+    @Query(
+        """
+        SELECT * FROM ai_movies
+        WHERE durationSeconds > :minDurationSeconds
+        ORDER BY isFeatured DESC, isScrapedLive DESC, ratingScore DESC, addedAt DESC
+        """
+    )
+    fun observeAllMovies(minDurationSeconds: Int = MIN_FEATURE_DURATION_SECONDS): Flow<List<AiMovieEntity>>
 
     @Query("SELECT * FROM ai_movies WHERE id = :movieId LIMIT 1")
     fun observeMovieById(movieId: String): Flow<AiMovieEntity?>
@@ -21,8 +28,8 @@ interface CinemaDao {
     @Query("SELECT * FROM ai_movies WHERE id = :movieId LIMIT 1")
     suspend fun getMovieById(movieId: String): AiMovieEntity?
 
-    @Query("SELECT COUNT(*) FROM ai_movies")
-    suspend fun getMovieCount(): Int
+    @Query("SELECT COUNT(*) FROM ai_movies WHERE durationSeconds > :minDurationSeconds")
+    suspend fun getMovieCount(minDurationSeconds: Int = MIN_FEATURE_DURATION_SECONDS): Int
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMovies(movies: List<AiMovieEntity>)
@@ -32,6 +39,9 @@ interface CinemaDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMovie(movie: AiMovieEntity)
+
+    @Query("DELETE FROM ai_movies WHERE durationSeconds <= :minDurationSeconds")
+    suspend fun pruneShortMovies(minDurationSeconds: Int = MIN_FEATURE_DURATION_SECONDS): Int
 
     @Query("SELECT * FROM watch_history")
     fun observeAllHistory(): Flow<List<WatchHistoryEntity>>

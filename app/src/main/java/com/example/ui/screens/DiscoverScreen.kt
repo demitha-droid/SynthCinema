@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MovieFilter
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -59,15 +60,19 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.data.model.AiMovieEntity
 import com.example.data.model.MovieGenre
 import com.example.ui.CinemaUiState
 import com.example.ui.SourceFilter
+import com.example.ui.YouTubeMovieSearchUiState
 import com.example.ui.components.GenreChipRow
 import com.example.ui.components.HeroSpotlightCard
 import com.example.ui.components.ImportUrlDialog
 import com.example.ui.components.MovieHorizontalCard
 import com.example.ui.components.MovieListCard
 import com.example.ui.components.ScraperStatusBanner
+import com.example.ui.components.YouTubeMovieResultsPanel
+import com.example.ui.components.YouTubeMovieSearchBar
 import com.example.ui.theme.FacebookAzure
 import com.example.ui.theme.ObsidianCanvas
 import com.example.ui.theme.ProjectorAmber
@@ -77,7 +82,14 @@ import com.example.ui.theme.YouTubeCrimson
 @Composable
 fun DiscoverScreen(
     uiState: CinemaUiState,
+    ytMovieSearchState: YouTubeMovieSearchUiState,
     onSearchQueryChanged: (String) -> Unit,
+    onYouTubeMovieQueryChanged: (String) -> Unit,
+    onSearchYouTubeMovies: () -> Unit,
+    onClearYouTubeMovieSearch: () -> Unit,
+    onSaveYouTubeMovie: (AiMovieEntity) -> Unit,
+    onWatchYouTubeMovie: (AiMovieEntity) -> Unit,
+    onSaveAllYouTubeMovies: () -> Unit,
     onGenreSelected: (MovieGenre) -> Unit,
     onSourceSelected: (SourceFilter) -> Unit,
     onScrapeFresh: () -> Unit,
@@ -88,6 +100,9 @@ fun DiscoverScreen(
     modifier: Modifier = Modifier
 ) {
     var showImportDialog by remember { mutableStateOf(false) }
+    val savedMovieIds = remember(uiState.allMovies) {
+        uiState.allMovies.map { it.movie.id }.toSet()
+    }
 
     val isSearchingOrFiltered = uiState.searchQuery.isNotBlank() ||
         uiState.selectedGenre != MovieGenre.ALL ||
@@ -155,7 +170,7 @@ fun DiscoverScreen(
                             )
                         }
                         Text(
-                            text = "${uiState.allMovies.size} AI films • YouTube & Facebook",
+                            text = "${uiState.allMovies.size} feature films (>45m) • YT & FB",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
@@ -272,12 +287,36 @@ fun DiscoverScreen(
                 )
             }
 
+            // Second Search Bar: Search YouTube Directly for AI Movies (>45m)
+            item(key = "youtube_movie_search_bar") {
+                YouTubeMovieSearchBar(
+                    state = ytMovieSearchState,
+                    onQueryChanged = onYouTubeMovieQueryChanged,
+                    onSearch = onSearchYouTubeMovies,
+                    onClear = onClearYouTubeMovieSearch
+                )
+            }
+
+            if (ytMovieSearchState.isSearching || ytMovieSearchState.hasSearched) {
+                item(key = "youtube_movie_search_results") {
+                    YouTubeMovieResultsPanel(
+                        state = ytMovieSearchState,
+                        savedMovieIds = savedMovieIds,
+                        onWatchMovie = onWatchYouTubeMovie,
+                        onSaveMovie = onSaveYouTubeMovie,
+                        onSaveAll = onSaveAllYouTubeMovies,
+                        onClear = onClearYouTubeMovieSearch
+                    )
+                }
+            }
+
             // Platform Source Filter Row (All / YouTube / Facebook)
             item(key = "source_filters") {
                 LazyRow(
                     modifier = Modifier.fillMaxWidth(),
                     contentPadding = PaddingValues(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     items(SourceFilter.entries, key = { it.name }) { source ->
                         val selected = source == uiState.selectedSource
@@ -312,6 +351,37 @@ fun DiscoverScreen(
                             modifier = Modifier.testTag("source_filter_${source.name.lowercase()}")
                         )
                     }
+                    item(key = "duration_rule_pill") {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = ProjectorAmber.copy(alpha = 0.14f),
+                            border = BorderStroke(1.dp, ProjectorAmber.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .height(32.dp)
+                                .padding(top = 0.dp)
+                                .testTag("duration_rule_badge")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Timer,
+                                    contentDescription = null,
+                                    tint = ProjectorAmber,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "> 45m Only",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = ProjectorAmber,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
@@ -335,17 +405,23 @@ fun DiscoverScreen(
                 }
             }
 
-            // Empty Search State
+            // Initial Scraping State or Empty Search State
             if (uiState.filteredMovies.isEmpty()) {
-                item(key = "empty_search") {
-                    EmptyDiscoveryCard(
-                        onResetFilters = {
-                            onSearchQueryChanged("")
-                            onGenreSelected(MovieGenre.ALL)
-                            onSourceSelected(SourceFilter.ALL)
-                        },
-                        onScrapeFresh = onScrapeFresh
-                    )
+                if (uiState.isScraping && uiState.allMovies.isEmpty()) {
+                    item(key = "initial_scraping") {
+                        ScrapingCatalogCard()
+                    }
+                } else {
+                    item(key = "empty_search") {
+                        EmptyDiscoveryCard(
+                            onResetFilters = {
+                                onSearchQueryChanged("")
+                                onGenreSelected(MovieGenre.ALL)
+                                onSourceSelected(SourceFilter.ALL)
+                            },
+                            onScrapeFresh = onScrapeFresh
+                        )
+                    }
                 }
             } else if (!isSearchingOrFiltered) {
                 // Full Editorial Cinema Home: Hero Spotlight + Continue Watching + Genre Rails
@@ -545,6 +621,44 @@ private fun EmptyDiscoveryCard(
                     Text(stringResource(R.string.action_scrape_fresh))
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ScrapingCatalogCard() {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, ProjectorAmber.copy(alpha = 0.45f))
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            CircularProgressIndicator(
+                color = ProjectorAmber,
+                strokeWidth = 3.dp,
+                modifier = Modifier.size(36.dp)
+            )
+            Text(
+                text = "Scraping Feature-Length AI Movies",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Scanning YouTube & Facebook for AI films strictly longer than 45 minutes and filtering out shorter clips…",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
         }
     }
 }

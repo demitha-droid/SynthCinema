@@ -25,9 +25,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Subscriptions
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -66,13 +69,21 @@ import com.example.R
 import com.example.data.model.CreatorChannelEntity
 import com.example.data.model.MovieGenre
 import com.example.data.model.MovieSource
+import com.example.data.model.YouTubeChannelSearchResult
 import com.example.ui.CinemaUiState
+import com.example.ui.YouTubeChannelSearchUiState
 import com.example.ui.components.SourceBadge
+import com.example.ui.components.YouTubeChannelSearchCard
 import com.example.ui.theme.FacebookAzure
 import com.example.ui.theme.ObsidianCanvas
 import com.example.ui.theme.ProjectorAmber
 import com.example.ui.theme.SynthCyan
 import com.example.ui.theme.YouTubeCrimson
+
+private enum class ChannelAddMode {
+    SEARCH_YOUTUBE,
+    DIRECT_URL
+}
 
 private data class SuggestedCreator(
     val label: String,
@@ -92,6 +103,14 @@ private val suggestedCreators = listOf(
 @Composable
 fun ChannelsScreen(
     uiState: CinemaUiState,
+    channelSearchState: YouTubeChannelSearchUiState,
+    onChannelSearchKeywordChanged: (String) -> Unit,
+    onChannelSearchGenreChanged: (MovieGenre) -> Unit,
+    onSearchYouTubeChannels: (String?) -> Unit,
+    onToggleSelectYouTubeChannel: (String) -> Unit,
+    onClearSelectedYouTubeChannels: () -> Unit,
+    onAddSelectedYouTubeChannels: () -> Unit,
+    onAddSingleSearchedYouTubeChannel: (YouTubeChannelSearchResult) -> Unit,
     onAddChannel: (MovieSource, String, MovieGenre, () -> Unit) -> Unit,
     onSyncChannel: (CreatorChannelEntity) -> Unit,
     onSyncAllChannels: () -> Unit,
@@ -99,6 +118,7 @@ fun ChannelsScreen(
     onBrowseChannelMovies: (CreatorChannelEntity) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var addMode by remember { mutableStateOf(ChannelAddMode.SEARCH_YOUTUBE) }
     var selectedSource by remember { mutableStateOf(MovieSource.YOUTUBE) }
     var inputHandleOrUrl by remember { mutableStateOf("") }
     var selectedGenre by remember { mutableStateOf(MovieGenre.ALL) }
@@ -202,12 +222,109 @@ fun ChannelsScreen(
                 }
             }
 
-            // Add YouTube Channel / Facebook Profile Card
-            item(key = "add_creator_card") {
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp),
+            // Mode Switcher: Search YouTube by Keywords vs Direct URL / Handle
+            item(key = "channel_add_mode_tabs") {
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    item(key = "mode_search_yt") {
+                        val selected = addMode == ChannelAddMode.SEARCH_YOUTUBE
+                        FilterChip(
+                            selected = selected,
+                            onClick = { addMode = ChannelAddMode.SEARCH_YOUTUBE },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Filled.Search,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            label = {
+                                Text(
+                                    text = stringResource(R.string.channel_mode_search_yt),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = YouTubeCrimson.copy(alpha = 0.22f),
+                                selectedLabelColor = YouTubeCrimson,
+                                selectedLeadingIconColor = YouTubeCrimson,
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+                            ),
+                            border = FilterChipDefaults.filterChipBorder(
+                                enabled = true,
+                                selected = selected,
+                                borderColor = MaterialTheme.colorScheme.outline,
+                                selectedBorderColor = YouTubeCrimson
+                            ),
+                            modifier = Modifier.testTag("mode_tab_search_youtube")
+                        )
+                    }
+                    item(key = "mode_direct_url") {
+                        val selected = addMode == ChannelAddMode.DIRECT_URL
+                        FilterChip(
+                            selected = selected,
+                            onClick = { addMode = ChannelAddMode.DIRECT_URL },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Filled.Link,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            label = {
+                                Text(
+                                    text = stringResource(R.string.channel_mode_direct_url),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = SynthCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = SynthCyan,
+                                selectedLeadingIconColor = SynthCyan,
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+                            ),
+                            border = FilterChipDefaults.filterChipBorder(
+                                enabled = true,
+                                selected = selected,
+                                borderColor = MaterialTheme.colorScheme.outline,
+                                selectedBorderColor = SynthCyan
+                            ),
+                            modifier = Modifier.testTag("mode_tab_direct_url")
+                        )
+                    }
+                }
+            }
+
+            if (addMode == ChannelAddMode.SEARCH_YOUTUBE) {
+                item(key = "youtube_channel_search_card") {
+                    YouTubeChannelSearchCard(
+                        searchState = channelSearchState,
+                        followedChannels = uiState.channels,
+                        onKeywordChanged = onChannelSearchKeywordChanged,
+                        onGenreChanged = onChannelSearchGenreChanged,
+                        onSearch = onSearchYouTubeChannels,
+                        onToggleSelect = onToggleSelectYouTubeChannel,
+                        onClearSelection = onClearSelectedYouTubeChannels,
+                        onAddSelected = onAddSelectedYouTubeChannels,
+                        onAddSingle = onAddSingleSearchedYouTubeChannel
+                    )
+                }
+            } else {
+                // Add YouTube Channel / Facebook Profile Card (Direct URL / Handle)
+                item(key = "add_creator_card") {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
                     shape = RoundedCornerShape(20.dp),
                     color = MaterialTheme.colorScheme.surface,
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
@@ -233,6 +350,33 @@ fun ChannelsScreen(
                                 style = MaterialTheme.typography.titleLarge,
                                 color = MaterialTheme.colorScheme.onBackground
                             )
+                        }
+
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = ProjectorAmber.copy(alpha = 0.12f),
+                            border = BorderStroke(1.dp, ProjectorAmber.copy(alpha = 0.35f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("channels_duration_rule_notice")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Timer,
+                                    contentDescription = null,
+                                    tint = ProjectorAmber,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = "Filter rule active: Only uploads longer than 45 minutes are added to your database.",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onBackground
+                                )
+                            }
                         }
 
                         // Platform selector
@@ -364,6 +508,7 @@ fun ChannelsScreen(
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(stringResource(R.string.action_add_channel))
                             }
+                            }
                         }
                     }
                 }
@@ -456,7 +601,7 @@ fun ChannelsScreen(
                                 color = MaterialTheme.colorScheme.onBackground
                             )
                             Text(
-                                text = "Add any YouTube channel handle/URL or Facebook profile above, or tap a suggested creator to automatically scrape and save their AI movies.",
+                                text = "Add any YouTube channel handle/URL or Facebook profile above, or tap a suggested creator to automatically scrape and save their AI movies longer than 45 minutes.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
